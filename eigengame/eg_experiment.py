@@ -93,14 +93,14 @@ def get_first(xs):
   """Gets values from the first device."""
   return jax.tree_util.tree_map(lambda x: x[0], xs)
 
-
 class EigenGame:
   """Jaxline object for running Eigengame Experiments."""
 
 
-  def __init__(self):
-    self.eigenvector_count = 128
+  def __init__(self, init_rng, n_components = 2):
+    self.eigenvector_count = n_components
     self.epsilon = 1e-4
+    self.init_rng  = init_rng
 
 
 
@@ -182,11 +182,4 @@ class EigenGame:
     for batch in data_stream:
       tstate = update(tstate, batch)
     return jax.device_get(tstate.params)
-        # np.save("eigenvectors.bin", vecs)
         
-# if __name__ == "__main__":
-  # eigenvectors = EigenGame().fit(data_stream)
-import sys
-sys.path.append("/home/alex/Desktop/DeepLearning/Projects/DeepLearningProject")
-
-    

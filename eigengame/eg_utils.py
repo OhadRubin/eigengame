@@ -24,7 +24,7 @@ from absl import logging
 import chex
 import jax
 import jax.numpy as jnp
-from jaxline import utils
+
 
 import numpy as np
 

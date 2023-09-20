@@ -144,7 +144,8 @@ def initialize_eigenvectors(
   shapes = [(per_device_count, *leaf.shape[1:]) for leaf in leaves]
 
   eigenvectors = []
-  per_device_keys = jax.random.split(rng_key, local_device_count)
+  per_device_keys = jax.random.split(rng_key[0][0], local_device_count)
+  # per_device_keys = rng_key
   for per_device_key in per_device_keys:
     # generate a different key for each leaf on each device
     per_leaf_keys = jax.random.split(per_device_key, len(leaves))
@@ -180,6 +181,7 @@ def get_local_slice(
   """
 
   def get_slice(all_vectors):
+    print(all_vectors.shape, local_identity_slice.shape)
     return jnp.einsum(
         'k..., lk -> l...',
         all_vectors,

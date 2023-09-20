@@ -29,14 +29,24 @@ import chex
 import optax
 from flax import core
 from flax import struct
-
-
+from flax.jax_utils import replicate
+from einops import rearrange
+def add_process_dim(x, num_processes=None):
+    if num_processes is None:
+        num_processes = jax.local_device_count()
+    """ Add a process dimension to a tensor. """
+    if x is None or not hasattr(x, 'shape'):
+        return x
+    return rearrange(x, '(p l)  ... -> p l ... ', p=num_processes)
 
 class TrainState(struct.PyTreeNode):
   step: int
   params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+  aux_params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
   tx: optax.GradientTransformation = struct.field(pytree_node=False)
+  aux_tx: optax.GradientTransformation = struct.field(pytree_node=False)
   opt_state: optax.OptState = struct.field(pytree_node=True)
+  aux_opt_state: optax.OptState = struct.field(pytree_node=True)
 
   def apply_gradients(self, *, grads, aux_grads, **kwargs):
     
@@ -63,6 +73,7 @@ class TrainState(struct.PyTreeNode):
     return cls(
         step=0,
         params=params,
+        aux_params=aux_params,
         tx=tx,
         aux_tx=aux_tx,
         opt_state=opt_state,
@@ -97,7 +108,7 @@ class EigenGame:
   """Jaxline object for running Eigengame Experiments."""
 
 
-  def __init__(self, init_rng, n_components = 2):
+  def __init__(self,init_rng, n_components = 2):
     self.eigenvector_count = n_components
     self.epsilon = 1e-4
     self.init_rng  = init_rng
@@ -121,7 +132,8 @@ class EigenGame:
         initial_eigenvectors,
     )
     return initial_eigenvectors, auxiliary_variables
-
+  
+  @functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
   def update_eigenvectors(
       self,
       tstate,
@@ -153,9 +165,11 @@ class EigenGame:
     return tstate
     
   def fit(self, data_stream):
-
+    batch = next(data_stream)
     # Initialize the eigenvalues and mean estimate from a batch of data
-    eigenvectors, auxiliary_variables = self.initialize_eigenvector_params(self.init_rng)
+    batch = add_process_dim(batch)
+    # batch = replicate(batch)
+    eigenvectors, auxiliary_variables = self.initialize_eigenvector_params(batch)
 
     update = functools.partial(
         jax.pmap(
@@ -175,11 +189,23 @@ class EigenGame:
                   eps=1e-8,
                   )
     aux_optimizer = optax.sgd(learning_rate=1e-3)
+    # print(f"{auxiliary_variables.shape=}")
+    # print(f"{eigenvectors.shape=}")
+    # print(f"{batch.shape=}")
+
     
-    
-    tstate = jax.pmap(TrainState.create)(eigenvectors, auxiliary_variables, optimizer, aux_optimizer)
+    tstate = TrainState.create(
+          params=eigenvectors,
+          aux_params=auxiliary_variables,
+          tx=optimizer,
+          aux_tx=aux_optimizer
+          )
+    tstate = replicate(tstate)
     
     for batch in data_stream:
+      batch = add_process_dim(batch)
+      # print(batch.shape)
+      # batch = replicate(batch)
       tstate = update(tstate, batch)
     return jax.device_get(tstate.params)
         

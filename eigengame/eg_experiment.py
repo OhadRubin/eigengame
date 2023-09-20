@@ -259,15 +259,11 @@ class AbstractEigenGameExperiment(experiment.AbstractExperiment):
   ) -> chex.ArrayTree:
     """Initializes the eigenvalues, mean estimates and auxiliary variables."""
     init_batch = next(self._data_generator)
-    local_init_data = eg_utils.get_first(init_batch)
-    model_rng, eigenvector_rng = jax.random.split(init_rng, 2)
-    local_activiation_batch = self._net_activations(local_init_data, model_rng)
-    if self._num_samples > 1:
-      local_activiation_batch = local_activiation_batch[0]
+    local_activiation_batch = eg_utils.get_first(init_batch)
     initial_eigenvectors = eg_utils.initialize_eigenvectors(
         self._eigenvector_count,
         local_activiation_batch,
-        eigenvector_rng,
+        init_rng,
     )
 
     initial_mean_estimate = jax.device_put_replicated(

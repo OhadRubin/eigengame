@@ -29,13 +29,6 @@ from jaxline import utils
 import numpy as np
 
 
-class ExperimentType(enum.Enum):
-  BIASED_CCA = 'biased_cca'
-  CCA = 'unbiased_cca'
-  PLS = 'unbiased_pls'
-  ICA = 'unbiased_ica'
-  PCA = 'pca'
-  MATRIX_INVERSE = 'matrix_inverse'
 
 
 class SplitVector(NamedTuple):
@@ -83,32 +76,6 @@ def init_aux_variables(
       ),
       b_inner_product_diag=jnp.zeros(total_eigenvectors),
   )
-
-
-class AuxiliaryMovingAverage:
-  """Simple class which computes the moving average of the auxiliary variables.
-
-  This is used in the generalized eigenvalue problem, where the reciprocal of
-  an estimate may have a severe biasing effect for small batches.
-  """
-
-  def __init__(self, max_len: int):
-    self._values = collections.deque(maxlen=max_len)
-
-  def get_moving_average(self) -> Optional[chex.ArrayTree]:
-    if not self._values:
-      return None
-    length = len(self._values)
-    values_sum = jax.tree_map(
-        lambda *x: sum(x),
-        self._values[0],
-        *list(self._values)[1:],
-    )
-    return jax.tree_map(lambda x: x / length, values_sum)
-
-  def add_value(self, new_value: chex.ArrayTree) -> None:
-    self._values.append(new_value)
-
 
 def get_spherical_gradients(
     gradient: chex.ArrayTree,
@@ -294,26 +261,4 @@ def tree_einsum_broadcast(
     return jax.tree_util.tree_reduce(reduce_f, mapped_tree)
 
 
-def get_first(xs):
-  """Gets values from the first device."""
-  return jax.tree_util.tree_map(lambda x: x[0], xs)
 
-
-class InMemoryCheckpointerPlusSaveEigVecs(utils.InMemoryCheckpointer):
-  """A Checkpointer reliant on an in-memory global dictionary."""
-
-  def __init__(self, config, mode: str):
-    super().__init__(config, mode)
-    self._checkpoint_dir = config.checkpoint_dir
-
-  def save(self, ckpt_series: str) -> None:
-    """Saves the checkpoint."""
-    super().save(ckpt_series)
-    series = utils.GLOBAL_CHECKPOINT_DICT[ckpt_series]
-    active_state = self.get_experiment_state(ckpt_series)
-    id_ = 0 if not series.history else series.history[-1].id + 1
-    filename = ckpt_series + '_' + str(id_)
-    filepath = os.path.join(self._checkpoint_dir, filename) + '.npy'
-    vecs = np.array(active_state.experiment_module.get_eigenvectors())
-    np.save(filepath, vecs)
-    logging.info('Saved eigenvectors to %s.', filepath)

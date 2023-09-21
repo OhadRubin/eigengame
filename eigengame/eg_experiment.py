@@ -14,6 +14,33 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+import abc
+import functools
+from typing import Callable, Dict, Iterator, Optional, Tuple
+from torch.utils.data import DataLoader
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+from typing import Any
+import chex
+import optax
+from flax import core
+from flax import struct
+from flax.jax_utils import replicate,unreplicate
+from torch.utils.data import DataLoader, Dataset, Sampler
+import random
+from sklearn.decomposition import PCA
+
+from einops import rearrange
+
+from typing import Tuple, Optional
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+
 
 
 
@@ -85,21 +112,6 @@ def get_local_slice(
     local_identity_slice: chex.Array,
     input_vector_tree: chex.ArrayTree,
 ) -> chex.ArrayTree:
-  """Get the local portion from all the eigenvectors.
-
-  Multiplying by a matrix here to select the vectors that we care about locally.
-  This is significantly faster than using jnp.take.
-
-  Args:
-    local_identity_slice: A slice of the identity matrix denoting the vectors
-      which we care about locally
-    input_vector_tree: An array tree of data, with the first index querying all
-      the vectors.
-
-  Returns:
-      A pytree of the same structure as input_vector_tree, but with only the
-      relevant vectors specified in the identity.
-  """
 
   def get_slice(all_vectors):
     return jnp.einsum(
@@ -159,22 +171,6 @@ def tree_einsum_broadcast(
     *array_operands: chex.Array,
     reduce_f: Optional[Callable[[chex.Array, chex.Array], chex.Array]] = None
 ) -> Union[chex.ArrayTree, chex.Array]:
-  """Applies an einsum operation on a list of arrays to all leaves of a tree.
-
-  Args:
-    subscripts: subscript string denoting the einsum operation. The first
-      argument must denote the tree leaf, followed by the list of arrays.
-    tree: A pytree. The einsum will be applied with the leaves of this tree in
-      the first argument.
-    *array_operands: A list of arrays. The sinsum with these arrays will be
-      mapped to each leaf in the tree.
-    reduce_f: Function denoting a reduction. If not left empty, this calls a
-      tree reduce on the resulting tree after the einsum.
-
-  Returns:
-      A pytree with the same structure as the input tree. if reduce_f.
-      Otherwise an array which is the result of the reduction.
-  """
   einsum_function = lambda leaf: jnp.einsum(subscripts, leaf, *array_operands)
   mapped_tree = jax.tree_map(einsum_function, tree)
   if reduce_f is None:
@@ -186,78 +182,12 @@ def tree_einsum_broadcast(
 
 
 
-
-# Copyright 2022 DeepMind Technologies Limited. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Different Eigengame gradients and their associated helpers.
-
-
-Einsum legend:
-...: the massive data dimension of the eigenvector which we're trying to do
-PCA/CCA/etc. on. The input data may not be contiguious, and may consist of
-multiple shapes in a pytree (e.g. images, activations of multiple layers of a
-neural net). Hence we use ellipses to denote it.
-l: local eigenvector index -- the number of eigenvectors per machine.
-k: global eigenvector index -- number of eigenvectors over all machines.
-b: batch dimension, batch size per machine.
-
-"""
-from typing import Tuple, Optional
-
-import chex
-# from eigengame import eg_utils
-import jax
-import jax.numpy as jnp
-import numpy as np
-
-# SplitVector = eg_utils.SplitVector
-
-
 def pca_unloaded_gradients(
     local_eigenvectors: chex.ArrayTree,
     sharded_data: chex.ArrayTree,
     mask: chex.Array,
     sliced_identity: chex.Array,
 ) -> chex.ArrayTree:
-  """Calculates the gradients for each of the eigenvectors for EG unloaded.
-
-  Calculates the gradients of eigengame unloaded (see Algorithm 1. of
-  https://arxiv.org/pdf/2102.04152.pdf)
-
-  This is done in a distributed manner. Each TPU is responsible for updating
-  the whole of a subset of eigenvectors, and get a different batch of the data.
-  The training data is applied and then aggregated to increase the effective
-  batch size.
-
-  Args:
-    local_eigenvectors: eigenvectors sharded across machines in
-      a ShardedDeviceArray. ArrayTree with leaves of shape:
-      [eigenvectors_per_device, ...]
-    sharded_data: Training data sharded across machines. ArrayTree with leaves
-      of shape: [batch_size_per_device, ...]
-    mask: Mask with 1s below the diagonal and then sharded across devices, used
-      to calculate the penalty. Shape of: [eigenvectors_per_device,
-        total_eigenvector_count]
-    sliced_identity: Sharded copy of the identity matrix used to calculate the
-      reward. Shape of: [eigenvectors_per_device, total_eigenvector_count]
-
-  Returns:
-    Gradients for the local eigenvectors. ArrayTree with leaves of shape:
-   [eigenvectors_per_device, ...] on each device.
-  """
   # Collect the matrices from all the other machines.
   all_eigenvectors = jax.lax.all_gather(
       local_eigenvectors,
@@ -314,32 +244,6 @@ def _generalized_eg_matrix_inner_products(
     a_vector_product: chex.ArrayTree,
     aux_b_vector_product: chex.ArrayTree,
 ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array,]:
-  """Compute various inner product quantities used in the gradient.
-
-  In particular, the loss requires the various forms of inner product
-  <v_i, Av_j> in order to function. This function calculates all of them to keep
-  the gradient function less cluttered.
-
-
-  Args:
-    local_eigenvectors: ArrayTree with local copies of generalised eigen
-      vectors with leaves of shape [l, ...] denoting v_l.
-    all_eigenvectors: ArrayTree with all generalised eigen vectors with leaves
-      of shape [k, ...] denoting v_k
-    b_vector_product: ArrayTree with all B matrix eigenvector products with
-      leaves of shape [k, ...] denoting Bv_k
-    a_vector_product: ArrayTree with all A matrix eigenvector products with
-      leaves of shape [k, ...] denoting Av_k
-    aux_b_vector_product: ArrayTree with all B matrix eigenvector products from
-      the axuiliary variable with leaves of shape [k, ...] denoting Bv_k
-
-  Returns:
-    Tuple of arrays containing:
-      local_b_inner_product: <v_l, Bv_k>
-      local_a_inner_product: <v_l, Av_k>
-      b_inner_product_diag: <v_k, Bv_k>
-      a_inner_product_diag: : <v_k, Bv_k>
-  """
 
   # Evaluate the various forms of the inner products used in the gradient
   local_aux_b_inner_product = tree_einsum(
@@ -380,26 +284,6 @@ def _generalized_eg_gradient_reward(
     local_b_vector_product: chex.ArrayTree,
     local_a_vector_product: chex.ArrayTree,
 ) -> chex.ArrayTree:
-  """Evaluates the reward term for the eigengame gradient for local vectors.
-
-  This attempts to maximise the rayleigh quotient for each eigenvector, and
-  by itself would find the eigenvector with the largest generalized eigenvalue.
-
-  The output corresponds to the equation for all l:
-    <v_l,Bv_l>Av_l - <v_l,Av_l>Bv_l
-
-  Args:
-    local_b_inner_product_diag: Array of shape [l] corresponding to <v_l,Bv_l>.
-    local_a_inner_product_diag: Array of shape [l] corresponding to <v_l,Av_l>.
-    local_b_vector_product: ArrayTree with local eigen vectors products with
-      B with leaves of shape [l, ...] denoting Bv_l.
-    local_a_vector_product: ArrayTree with local eigen vectors products with
-      A with leaves of shape [l, ...] denoting Av_l.
-
-  Returns:
-    The reward gradient for the eigenvectors living on the current machine.
-    Array tree with leaves of shape [l, ...]
-  """
   # Evaluates <v_l,Bv_l>Av_l
   scaled_a_vectors = tree_einsum_broadcast(
       'l..., l -> l...',
@@ -428,45 +312,6 @@ def _generalized_eg_gradient_penalty(
     b_vector_product: chex.ArrayTree,
     mask: chex.Array,
     b_diag_min: float = 1e-6) -> chex.ArrayTree:
-  r"""Evaluates the penalty term for the eigengame gradient for local vectors.
-
-  This attempts to force each eigenvalue to be B orthogonal (i.e. <v,Bw> = 0) to
-  all its parents. Combining this with the reward terms means each vector
-  learns to maximise the eigenvalue whilst staying orthogonal, giving us the top
-  k generalized eigenvectors.
-
-
-  The output corresponds to the equation for all l on the local machine:
-   \\sum_{k<l}(<v_l,Bv_l>Bv_k - <v_l,Bv_k>Bv_l) <v_l,Av_k>/<v_k,Bv_k>
-
-  Note: If the gradient returned must be unbiased, then any estimated quantities
-  in the formula below must be independent and unbiased (.e.g, the numerator of
-  the first term (<v_l,Av_k>/<v_k,Bv_k>)<v_l,Bv_l>Bv_k must use independent,
-  unbiase estimates for each element of this product, otherwise the estimates
-  are correlated and will bias the computation). Furthermore, any terms in the
-  denominator must be deterministic (i.e., <v_k,Bv_k> must be computed without
-  using sample estimates which can be accomplished by introducing an auxiliary
-  learning variable).
-
-  Args:
-    local_b_inner_product: Array of shape [l,k] denoting <v_l, Bv_k>
-    local_a_inner_product: Array of shape [l,k] denoting <v_l, Av_k>
-    local_b_inner_product_diag: Array of shape [l] denoting <v_l, Bv_l>
-    b_inner_product_diag: Array of shape [k] denoting <v_k, Bv_k>. Insert an
-      auxiliary variable here for in order to debias the receprocal.
-    local_b_vector_product: ArrayTree with local eigen vectors products with
-      B with leaves of shape [l, ...] denoting Bv_l.
-    b_vector_product: ArrayTree with all eigen vectors products with
-      B with leaves of shape [k, ...] denoting Bv_k.
-    mask: Slice of a k x k matrix which is 1's under the diagonals and 0's
-      everywhere else. This is used to denote the parents of each vector. Array
-      of shape [l, k].
-    b_diag_min: Minimum value for the b_inner_product_diag. This value is
-      divided, so we use this to ensure we don't get a division by zero.
-
-  Returns:
-    The penalty gradient for the eigenvectors living on the current machine.
-  """
   # Calculate <v_l,Av_k>/<v_k,Bv_k> with mask
   scale = jnp.einsum(
       'lk, lk, k -> lk',
@@ -503,41 +348,6 @@ def generalized_eigengame_gradients(
     epsilon: Optional[float] = None,
     maximize: bool = True,
 ) -> Tuple[chex.ArrayTree, AuxiliaryParams,]:
-  """Solves for Av = lambda Bv using eigengame in a data parallel manner.
-
-  Algorithm pseudocode can be found in Algorithm 1 of overleaf doc:
-  https://ol.deepmind.host/read/kxdfdtfbsdxc
-
-  For moderately sized models this is fine, but for really large models (
-  moderate number of eigenvectors of >1m params) the memory overhead might be
-  strained in the parallel case.
-
-  Args:
-    local_eigenvectors: ArrayTree with local eigen vectors with leaves
-      of shape [l, ...] denoting v_l.
-    all_eigenvectors: ArrayTree with all eigen vectors with leaves
-      of shape [k, ...] denoting v_k.
-    a_vector_product: ArrayTree with all eigen vectors products with
-      A with leaves of shape [k, ...] denoting Av_k.
-    b_vector_product: ArrayTree with all eigen vectors products with
-      B with leaves of shape [k, ...] denoting Bv_k.
-    auxiliary_variables: AuxiliaryParams object which holds all the variables
-      which we want to update separately in order to avoid bias.
-    mask: Mask with 1s below the diagonal and then sharded across devices, used
-      to calculate the penalty. Shape of: [eigenvectors_per_device,
-        total_eigenvector_count]
-    sliced_identity: Sharded copy of the identity matrix used to calculate the
-      reward. Shape of: [eigenvectors_per_device, total_eigenvector_count]
-    epsilon: Add an isotropic term to the B matrix to make it
-      positive semi-definite. In this case, we're solving for: Av =
-        lambda*(B+epsilon*I)v.
-    maximize: Whether to search for top-k eigenvectors of Av = lambda*Bv (True)
-      or the top-k of (-A)v = lambda*Bv (False).
-
-  Returns:
-    returns the gradients for the eigenvectors and a new entry to update
-    auxiliary variable estimates.
-  """
   if not maximize:
     a_vector_product = -a_vector_product  # pytype: disable=unsupported-operands  # numpy-scalars
 
@@ -622,48 +432,6 @@ def pca_generalized_eigengame_gradients(
     epsilon: Optional[float] = 1e-4,
     maximize: bool = True,
     )->Tuple[chex.ArrayTree, AuxiliaryParams,]:
-  """Evaluates PCA gradients for two data sources with local data parallelism.
-
-  Implements PCA. In this case, we simply set the B matrix as I, which means
-  the problem is solving for Av=lambda v and we're back to the classic eigen
-  value problem.
-
-  This is not as lightweight as eigengame unloaded due to additional terms in
-  the calculation and handling of the auxiliary variables, and is mostly here to
-  demonstrate the flexibility of the generalized eigenvalue method. However,
-  adaptive optimisers may have an easier time with this since the gradients
-  for the generalized eigengame are naturally tangential to the unit sphere.
-
-  einsum legend:
-    l: local eigenvector index -- the number of eigenvectors per machine.
-    k: global eigenvector index -- number of eigenvectors over all machines.
-
-  Args:
-    local_eigenvectors: SplitVector with local eigen vectors products. Array
-      tree with leaves of shape [l, ...] denoting v_l.
-    sharded_data: SplitVector containing a batch of data from our two data
-      sources. Array tree with leaves of shape [b, ...].
-    auxiliary_variables: AuxiliaryParams object which holds all the variables
-      which we want to update separately in order to avoid bias.
-    mask: Mask with 1s below the diagonal and then sharded across devices, used
-      to calculate the penalty. Shape of: [eigenvectors_per_device,
-        total_eigenvector_count]
-    sliced_identity: Sharded copy of the identity matrix used to calculate the
-      reward. Shape of: [eigenvectors_per_device, total_eigenvector_count]
-    mean_estimate: SplitVector containing an estimate of the mean of the input
-      data if it is not centered by default. This is used to calculate the
-      covariances. Array tree with leaves of shape [...].
-    epsilon: Add an isotropic term to the A matrix to make it
-      positive semi-definite. In this case, we're solving for: (A+epsilon*I)v =
-        lambda*v.
-    maximize: unused- Solving Av = lambda * v is the only sensible approach for
-      PCA. We do not foresee a use case for (-Av) = lambda * v. Please contact
-      authors if you have a need for it.
-
-  Returns:
-    returns the gradients for the eigenvectors and a new entry to update
-    auxiliary variance estimates.
-  """
   del maximize
 
   # First, collect all the eigenvectors v_k
@@ -714,43 +482,6 @@ def pca_generalized_eigengame_gradients(
   )
 
 
-# Copyright 2022 DeepMind Technologies Limited. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-"""Boilerplate needed to do a jaxline experiment with Eigengame."""
-import abc
-import functools
-from typing import Callable, Dict, Iterator, Optional, Tuple
-from torch.utils.data import DataLoader
-import chex
-# from eigengame import eg_gradients
-# from eigengame import eg_utils
-import jax
-import jax.numpy as jnp
-import numpy as np
-from typing import Any
-import chex
-import optax
-from flax import core
-from flax import struct
-from flax.jax_utils import replicate,unreplicate
-from torch.utils.data import DataLoader, Dataset, Sampler
-import random
-from sklearn.decomposition import PCA
-
-from einops import rearrange
 
 def add_device_dim(x, num_processes=None):
     if num_processes is None:
@@ -880,20 +611,6 @@ def initialize_eigenvectors(
     batch: chex.ArrayTree,
     rng_key: chex.PRNGKey,
 ) -> chex.ArrayTree:
-  """Initialize the eigenvectors on a unit sphere and shards it.
-
-  Args:
-    eigenvector_count: Total number of eigenvectors (i.e. k)
-    batch: A batch of the data we're trying to find the eigenvalues of. The
-      initialized vectors will take the shape and tree structure of this data.
-      Array tree with leaves of shape [b, ...].
-    rng_key: jax rng seed. For multihost, each host should have a different
-      seed in order to initialize correctly
-
-  Returns:
-    A pytree of initialized, normalized vectors in the same structure as the
-    input batch. Array tree with leaves of shape [num_devices, l, ...].
-  """
   device_count = jax.device_count()
   if eigenvector_count % device_count != 0:
     raise ValueError(f'Number of devices ({device_count}) must divide number of'

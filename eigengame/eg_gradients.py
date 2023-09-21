@@ -421,7 +421,8 @@ def generalized_eigengame_gradients(
 
 
 import functools
-@functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
+
+
 def pca_generalized_eigengame_gradients(
     local_eigenvectors: chex.ArrayTree,
     sharded_data: chex.ArrayTree,

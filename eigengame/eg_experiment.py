@@ -17,7 +17,7 @@
 import abc
 import functools
 from typing import Callable, Dict, Iterator, Optional, Tuple
-
+from torch.utils.data import DataLoader
 import chex
 from eigengame import eg_gradients
 from eigengame import eg_utils
@@ -30,6 +30,10 @@ import optax
 from flax import core
 from flax import struct
 from flax.jax_utils import replicate,unreplicate
+from torch.utils.data import DataLoader, Dataset, Sampler
+import random
+from sklearn.decomposition import PCA
+
 from einops import rearrange
 def add_device_dim(x, num_processes=None):
     if num_processes is None:
@@ -38,6 +42,29 @@ def add_device_dim(x, num_processes=None):
     if x is None or not hasattr(x, 'shape'):
         return x
     return rearrange(x, '(p l)  ... -> p l ... ', p=num_processes)
+  
+
+      
+class customSampler(Sampler) :
+    def __init__(self, size):
+        assert size > 0
+        self.size = size
+        self.order = list(range(size))
+    
+    def __iter__(self):
+        idx = 0
+        while True:
+            yield self.order[idx]
+            idx += 1
+            if idx == len(self.order):
+                random.shuffle(self.order)
+                idx = 0
+                
+def format_batch(batch):
+  batch = np.array(batch)
+  batch = {"params":batch}
+  batch = jax.tree_map(lambda x: add_device_dim(x), batch)
+  return batch
 
 class TrainState(struct.PyTreeNode):
   step: int
@@ -49,12 +76,21 @@ class TrainState(struct.PyTreeNode):
   aux_opt_state: optax.OptState = struct.field(pytree_node=True)
 
   def apply_gradients(self, *, grads, aux_grads, **kwargs):
-    
-    updates, new_opt_state = self.tx.update(jax.tree_map(lambda x: -x, grads), self.opt_state)
+    grads = jax.tree_map(lambda x: -x, grads)
+    aux_grads = jax.tree_map(
+        lambda x, y: x - y,
+        self.aux_params,
+        aux_grads,
+    )
+    print(jax.tree_map(lambda x:x.shape,grads))
+    print(jax.tree_map(lambda x:x.shape,self.opt_state))
+    updates, new_opt_state = self.tx.update(grads, self.opt_state)
     aux_updates, aux_new_opt_state = self.aux_tx.update(aux_grads, self.aux_opt_state)
     
     new_params = optax.apply_updates(self.params, updates)
-    aux_new_params = optax.apply_updates(self.params, aux_updates)
+    new_params = eg_utils.normalize_eigenvectors(new_params)
+
+    aux_new_params = optax.apply_updates(self.aux_params, aux_updates)
     return self.replace(
         step=self.step + 1,
         params=new_params,
@@ -82,6 +118,23 @@ class TrainState(struct.PyTreeNode):
     )
 
 
+
+
+def tree_unstack(tree):
+    """Takes a tree and turns it into a list of trees. Inverse of tree_stack.
+    For example, given a tree ((a, b), c), where a, b, and c all have first
+    dimension k, will make k trees
+    [((a[0], b[0]), c[0]), ..., ((a[k], b[k]), c[k])]
+    Useful for turning the output of a vmapped function into normal objects.
+    """
+    leaves, treedef = jax.tree_flatten(tree)
+    n_trees = leaves[0].shape[0]
+    new_leaves = [[] for _ in range(n_trees)]
+    for leaf in leaves:
+        for i in range(n_trees):
+            new_leaves[i].append(leaf[i])
+    new_trees = [treedef.unflatten(l) for l in new_leaves]
+    return new_trees
 
 @functools.partial(
     jax.pmap,
@@ -143,30 +196,8 @@ def initialize_eigenvectors(
   normalized_eigenvector = eg_utils.normalize_eigenvectors(eigenvector_tree)
 
   return normalized_eigenvector
-  # return jax.device_put_sharded(eigenvectors, jax.local_devices())
-
-def decaying_schedule_with_warmup(
-    step: int,
-    warm_up_step=10_000,
-    end_step=1_000_000,
-    base_lr=2e-4,
-    end_lr=1e-6
-) -> float:
-
-  warmup_lr = step * base_lr / warm_up_step
-  decay_shift = (warm_up_step * base_lr - end_step * end_lr) / (
-      end_lr - base_lr)
-  decay_scale = base_lr * (warm_up_step + decay_shift)
-  decay_lr = decay_scale / (step + decay_shift)
-  return jnp.where(step < warm_up_step, warmup_lr, decay_lr)
 
 
-
-def get_first(xs):
-  """Gets values from the first device."""
-  return jax.tree_util.tree_map(lambda x: x[0], xs)
-
-# @functools.partial(jax.pmap, axis_name='devices', static_broadcasted_argnums=0)
 def create_sharded_mask(eigenvector_count) -> chex.ArraySharded:
   """Defines a mask of 1s under the diagonal and shards it."""
   mask = np.ones((eigenvector_count, eigenvector_count))
@@ -182,7 +213,6 @@ def create_sharded_mask(eigenvector_count) -> chex.ArraySharded:
   ))
   return mask
 
-# @functools.partial(jax.pmap, axis_name='devices', static_broadcasted_argnums=0)
 def create_sharded_identity(eigenvector_count) -> chex.ArraySharded:
   """Create identity matrix which is then split across devices."""
   identity = np.eye(eigenvector_count)
@@ -198,6 +228,7 @@ def create_sharded_identity(eigenvector_count) -> chex.ArraySharded:
   ))
   return identity
 
+# pca_generalized_eigengame_gradients = functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
 class EigenGame:
   """Jaxline object for running Eigengame Experiments."""
 
@@ -207,58 +238,52 @@ class EigenGame:
     self.init_rng  = init_rng
     self.mask = create_sharded_mask(n_components)
     self.sliced_identity = create_sharded_identity(n_components)
-
-
-
-  
-  # @functools.partial(jax.pmap, axis_name='devices')
-  # @functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
-  def update_eigenvectors(
-      self,
-      tstate,
-      batch: chex.Array
-  ) -> Tuple[chex.ArrayTree, chex.ArrayTree, eg_utils.AuxiliaryParams,
-             eg_utils.AuxiliaryParams, Optional[chex.ArrayTree],
-             Optional[chex.ArrayTree],]:
-    # mask = create_sharded_mask(self.eigenvector_count)
-    # print(mask.shape)
-    # [jax.lax.axis_index("devices")]
-    # sliced_identity = create_sharded_identity(self.eigenvector_count)
-    # print(sliced_identity.shape)
+    self.groundtruth = None
+  def create_update_eigenvectors(self):
+    @functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0,donate_argnums=(0,))
+    def update_eigenvectors(
+        tstate,
+        batch: chex.Array,
+        mask,
+        sliced_identity
+        
+    ) -> Tuple[chex.ArrayTree, chex.ArrayTree, eg_utils.AuxiliaryParams,
+              eg_utils.AuxiliaryParams, Optional[chex.ArrayTree],
+              Optional[chex.ArrayTree],]:
+      """Calculates the new vectors, applies update and then renormalize."""
+      gradient, new_aux = eg_gradients.pca_generalized_eigengame_gradients(
+          local_eigenvectors=tstate.params,
+          sharded_data=batch,
+          auxiliary_variables=tstate.aux_params,
+          mask=mask,
+          sliced_identity=sliced_identity,
+          # epsilon=epsilon,
+      )
+      tstate = tstate.apply_gradients(grads=gradient, aux_grads=new_aux)
+      return tstate
+    return update_eigenvectors
     
-    """Calculates the new vectors, applies update and then renormalize."""
-    # pca_generalized_eigengame_gradients = functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
-    el = dict(local_eigenvectors=tstate.params,
-        sharded_data=batch,
-        auxiliary_variables=tstate.aux_params,
-        mask=self.mask,
-        sliced_identity=self.sliced_identity,)
-    print(jax.tree_map(lambda x: x.shape, el))
-    gradient, new_aux = eg_gradients.pca_generalized_eigengame_gradients(
-        local_eigenvectors=tstate.params,
-        sharded_data=batch,
-        auxiliary_variables=tstate.aux_params,
-        mask=self.mask,
-        sliced_identity=self.sliced_identity,
-        # epsilon=epsilon,
-    )
-    # Update and normalize the eigenvectors variables.
-    neg_grads = jax.tree_map(lambda x: -x, gradient)
-    auxiliary_error = jax.tree_map(
-        lambda x, y: x - y,
-        tstate.aux_params,
-        new_aux,
-    )
-    tstate = tstate.apply_gradients(grads=neg_grads, aux_grads=auxiliary_error)
-    tstate = tstate.replace(params=eg_utils.normalize_eigenvectors(tstate.params))
-    return tstate
-    
-  def fit(self, data_stream):
-    batch = next(data_stream)
-    # print(jax.tree_map(lambda x: x.shape, batch))
-    batch = jax.tree_map(lambda x: add_device_dim(x), batch)
-    # batch = add_device_dim(batch, jax.device_count())
-    # print(jax.tree_map(lambda x: x.shape, batch))
+  def fit(self, data,learning_rate=2e-4,steps=1000000,warmup_ratio=0.9,batch_size=512):
+    update_eigenvectors = self.create_update_eigenvectors()
+    groundtruth = PCA(n_components=self.eigenvector_count).fit(data).components_
+    #normalize the groundtruth to have unit norm
+    groundtruth = groundtruth/np.linalg.norm(groundtruth,axis=1,keepdims=True)
+    def decaying_schedule_with_warmup(
+        step: int,
+    ) -> float:
+      end_lr = 0.1*(learning_rate)
+      warm_up_step = int(steps*warmup_ratio)
+      warmup_lr = step * learning_rate / warm_up_step
+      decay_shift = (warm_up_step * learning_rate - steps * end_lr) / (
+          end_lr - learning_rate)
+      decay_scale = learning_rate * (warm_up_step + decay_shift)
+      decay_lr = decay_scale / (step + decay_shift)
+      return jnp.where(step < warm_up_step, warmup_lr, decay_lr)
+
+    data_stream = DataLoader(data, batch_size=batch_size,sampler=customSampler(data.shape[0]))
+    batch = next(iter(data_stream))
+    batch = format_batch(batch)
+
     
     eigenvectors = initialize_eigenvectors(
         self.eigenvector_count,
@@ -278,6 +303,7 @@ class EigenGame:
                   b2=0.999,
                   eps=1e-8,
                   )
+    # aux_optimizer = optax.sgd(learning_rate=1e-1)
     aux_optimizer = optax.sgd(learning_rate=1e-3)
     
     tstate = TrainState.create(
@@ -286,26 +312,38 @@ class EigenGame:
           tx=optimizer,
           aux_tx=aux_optimizer
           )
+      
+    def calculate_dist(tstate):
+      eigenvectors = jax.device_get(tstate.params)['params']
+      eigenvectors = np.squeeze(eigenvectors).reshape((self.eigenvector_count,-1))
+      
+      return np.square(eigenvectors-groundtruth).sum()
+    def calculate_dot(tstate):
+      eigenvectors = jax.device_get(tstate.params)['params']
+      eigenvectors = np.squeeze(eigenvectors).reshape((self.eigenvector_count,-1))
+      return eigenvectors@eigenvectors.T
     
-    # tstate = tstate.replace(step=replicate(tstate.step))
     def expand_zero_shape(x):
       if isinstance(x, float) or isinstance(x, int) or x.shape == ():
         return jnp.broadcast_to(x,jax.local_device_count())
       return x
-    tstate = jax.device_put(tstate)
     tstate = jax.tree_map(expand_zero_shape, tstate)
-    print(jax.tree_map(lambda x: x.shape, tstate))
+    tstate = jax.device_put_sharded(tree_unstack(tstate), jax.local_devices())
+    print(jax.tree_map(lambda x:x.shape,tstate))
+    
+    # tstate = jax.device_put(tstate)
+    step = 0
     for batch in data_stream:
-      # print(jax.tree_map(lambda x: x.shape, batch))
-      # batch = add_device_dim(batch)
-      batch = jax.tree_map(lambda x: add_device_dim(x), batch)
-      # print(jax.tree_map(lambda x: x.shape, batch))
-      # return tstate,batch
-      # print(batch.shape)
-      # print(jax.tree_map(lambda x: x.ndim, batch))
-      # print(batch.shape)
-      # batch = replicate(batch)
+      if batch.shape[0]!=batch_size:
+        continue
+      batch = format_batch(batch)
       
-      tstate = self.update_eigenvectors(tstate, batch)
-    return jax.device_get(tstate.params)
+      tstate = update_eigenvectors(tstate, batch, mask=self.mask, sliced_identity=self.sliced_identity)
+      # print(i)
+      if (step%1000) ==0:
+        print(f"{step} {calculate_dot(tstate)=}")
         
+      if step==steps:
+        break
+      step +=1
+    return jax.device_get(tstate.params)['params']

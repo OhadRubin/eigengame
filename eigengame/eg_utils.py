@@ -27,11 +27,13 @@ import jax.numpy as jnp
 
 
 import numpy as np
+from flax import struct
 
 
 
 
-class SplitVector(NamedTuple):
+
+class SplitVector(struct.PyTreeNode):
   """Generalized Eigenvector object used for CCA, PLS, etc.
 
   Concatenations and splits are some of the slowest things you can do on a TPU,
@@ -42,7 +44,7 @@ class SplitVector(NamedTuple):
   y: chex.ArrayTree
 
 
-class AuxiliaryParams(NamedTuple):
+class AuxiliaryParams(struct.PyTreeNode):
   r"""Container for auxiliary variables for $\gamma$-EigenGame."""
   b_vector_product: chex.ArrayTree
   b_inner_product_diag: chex.Array

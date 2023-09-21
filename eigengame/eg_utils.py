@@ -117,7 +117,6 @@ def get_local_slice(
   """
 
   def get_slice(all_vectors):
-    print(all_vectors.shape, local_identity_slice.shape)
     return jnp.einsum(
         'k..., lk -> l...',
         all_vectors,

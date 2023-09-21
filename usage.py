@@ -21,12 +21,9 @@ data, labels = load_digits(return_X_y=True)
 
 
 prng = jax.random.PRNGKey(0)
-# prng, init_rng = jax.random.split(prng)
-
 prng = jax.random.split(prng, 8)
-eigenvectors = EigenGame(n_components=32,init_rng=prng).fit(data)
+#We whiten the data before passing it to the EigenGame using scipy
+data = data - data.mean(axis=0)
+# data = data / data.std(axis=0)
+eigenvectors = EigenGame(n_components=8,init_rng=prng,eval_freq=1000).fit(data)
 eigenvectors = np.squeeze(eigenvectors)
-# eigenvectors = EigenGame(n_components=128,init_rng=init_rng).fit(dataloader)
-from sklearn.decomposition import PCA
-groundtruth = PCA(n_components=8).fit(data)
-groundtruth.components_@groundtruth.components_.T

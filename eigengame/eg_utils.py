@@ -54,28 +54,6 @@ EigenGameGradientFunction = Callable[..., Tuple[chex.ArrayTree,
 EigenGameQuotientFunction = Callable[..., Tuple[chex.ArrayTree, chex.ArrayTree]]
 
 
-@functools.partial(
-    jax.pmap,
-    in_axes=0,
-    out_axes=0,
-    axis_name='devices',
-    static_broadcasted_argnums=0,
-)
-def init_aux_variables(
-    device_count: int,
-    init_vectors: chex.ArrayTree,
-) -> AuxiliaryParams:
-  """Initializes the auxiliary variables from the eigenvalues."""
-  leaves, _ = jax.tree_util.tree_flatten(init_vectors)
-  per_device_eigenvectors = leaves[0].shape[0]
-  total_eigenvectors = per_device_eigenvectors * device_count
-  return AuxiliaryParams(
-      b_vector_product=jax.tree_map(
-          lambda leaf: jnp.zeros((total_eigenvectors, *leaf.shape[1:])),
-          init_vectors,
-      ),
-      b_inner_product_diag=jnp.zeros(total_eigenvectors),
-  )
 
 def get_spherical_gradients(
     gradient: chex.ArrayTree,
@@ -114,50 +92,6 @@ def normalize_eigenvectors(eigenvectors: chex.ArrayTree) -> chex.ArrayTree:
       eigenvectors,
   )
 
-
-def initialize_eigenvectors(
-    eigenvector_count: int,
-    batch: chex.ArrayTree,
-    rng_key: chex.PRNGKey,
-) -> chex.ArrayTree:
-  """Initialize the eigenvectors on a unit sphere and shards it.
-
-  Args:
-    eigenvector_count: Total number of eigenvectors (i.e. k)
-    batch: A batch of the data we're trying to find the eigenvalues of. The
-      initialized vectors will take the shape and tree structure of this data.
-      Array tree with leaves of shape [b, ...].
-    rng_key: jax rng seed. For multihost, each host should have a different
-      seed in order to initialize correctly
-
-  Returns:
-    A pytree of initialized, normalized vectors in the same structure as the
-    input batch. Array tree with leaves of shape [num_devices, l, ...].
-  """
-  device_count = jax.device_count()
-  local_device_count = jax.local_device_count()
-  if eigenvector_count % device_count != 0:
-    raise ValueError(f'Number of devices ({device_count}) must divide number of'
-                     'eigenvectors ({eigenvector_count}).')
-  per_device_count = eigenvector_count // device_count
-  leaves, treedef = jax.tree_flatten(batch)
-  shapes = [(per_device_count, *leaf.shape[1:]) for leaf in leaves]
-
-  eigenvectors = []
-  per_device_keys = jax.random.split(rng_key[0][0], local_device_count)
-  # per_device_keys = rng_key
-  for per_device_key in per_device_keys:
-    # generate a different key for each leaf on each device
-    per_leaf_keys = jax.random.split(per_device_key, len(leaves))
-    # generate random number for each leaf
-    vector_leaves = [
-        jax.random.normal(key, shape)
-        for key, shape in zip(per_leaf_keys, shapes)
-    ]
-    eigenvector_tree = jax.tree_unflatten(treedef, vector_leaves)
-    normalized_eigenvector = normalize_eigenvectors(eigenvector_tree)
-    eigenvectors.append(normalized_eigenvector)
-  return jax.device_put_sharded(eigenvectors, jax.local_devices())
 
 
 def get_local_slice(

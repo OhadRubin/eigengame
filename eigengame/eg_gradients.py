@@ -116,36 +116,6 @@ def pca_unloaded_gradients(
   return jax.tree_map(lambda x, y: x - y, reward, penalty)
 
 
-def create_sharded_mask(eigenvector_count: int) -> chex.ArraySharded:
-  """Defines a mask of 1s under the diagonal and shards it."""
-  mask = np.ones((eigenvector_count, eigenvector_count))
-  r, c = np.triu_indices(eigenvector_count)
-  mask[..., r, c] = 0
-  start_index = jax.process_index() * eigenvector_count // jax.process_count()
-  end_index = (jax.process_index()+1) * eigenvector_count // jax.process_count()
-  mask = mask[start_index:end_index]
-  mask = mask.reshape((
-      jax.local_device_count(),
-      eigenvector_count // jax.device_count(),
-      eigenvector_count,
-  ))
-  return jax.device_put_sharded(list(mask), jax.local_devices())
-
-
-def create_sharded_identity(eigenvector_count: int) -> chex.ArraySharded:
-  """Create identity matrix which is then split across devices."""
-  identity = np.eye(eigenvector_count)
-
-  start_index = jax.process_index() * eigenvector_count // jax.process_count()
-  end_index = (jax.process_index() +
-               1) * eigenvector_count // jax.process_count()
-  identity = identity[start_index:end_index]
-  identity = identity.reshape((
-      jax.local_device_count(),
-      eigenvector_count // jax.device_count(),
-      eigenvector_count,
-  ))
-  return jax.device_put_sharded(list(identity), jax.local_devices())
 
 
 def _generalized_eg_matrix_inner_products(
@@ -450,8 +420,8 @@ def generalized_eigengame_gradients(
   return gradient, new_auxiliary_variable
 
 
-
-
+import functools
+@functools.partial(jax.pmap, axis_name='devices', in_axes=0, out_axes=0)
 def pca_generalized_eigengame_gradients(
     local_eigenvectors: chex.ArrayTree,
     sharded_data: chex.ArrayTree,
@@ -459,7 +429,7 @@ def pca_generalized_eigengame_gradients(
     mask: chex.Array,
     sliced_identity: chex.Array,
     mean_estimate: Optional[chex.ArrayTree] = None,
-    epsilon: Optional[float] = None,
+    epsilon: Optional[float] = 1e-4,
     maximize: bool = True,
     )->Tuple[chex.ArrayTree, eg_utils.AuxiliaryParams,]:
   """Evaluates PCA gradients for two data sources with local data parallelism.
@@ -513,8 +483,7 @@ def pca_generalized_eigengame_gradients(
       axis=0,
       tiled=True,
   )
-  if mean_estimate is not None:
-    sharded_data = jax.tree_map(lambda x, y: x - y, sharded_data, mean_estimate)
+
 
   # Calculate X^TXv/b for all v. This and v are all you need to construct the
   # gradient. This is done on each machine with a different batch.
